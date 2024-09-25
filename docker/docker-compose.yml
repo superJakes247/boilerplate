@@ -1,0 +1,187 @@
+version: '3'
+
+services:
+  generate-env:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/ci/deploy-tools
+    volumes:
+      - .:/api
+    working_dir: /api
+    command: bash -c " ag-deploy encrypt -d -p ' ' \"$$(cat .env.enc)\" > .env && ag-deploy encrypt -d -p ' ' \"$$(cat .env.mocked.enc)\" > .env.mocked"
+
+  generate-enc:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/ci/deploy-tools
+    volumes:
+      - .:/api
+    working_dir: /api
+    command: bash -c " ag-deploy encrypt -p ' ' \"$$(cat .env)\" > .env.enc && ag-deploy encrypt -p ' ' \"$$(cat .env.mocked)\" > .env.mocked.enc"
+
+  scala-build:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/scala-devtools:13
+    volumes:
+      - .:/api
+      - ~/.cache/:/root/.cache/
+    working_dir: /api
+    command: bash -c "rm -rf dist && sbt clean update compile && sbt assembly"
+
+  sidecar:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/app-mock-health-monitor-sidecar:1
+    hostname: sidecar
+    container_name: sidecar
+    volumes:
+      - ./tests/.config/sidecar:/config
+    ports:
+      - "3300:3000"
+
+  testtools:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/node-testtools:18
+    user: node
+    volumes:
+      - ./:/api
+    working_dir: /api/tests
+
+  app-rabbitmq-server-platform:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/ecr-public/docker/library/rabbitmq:3.12-management-alpine
+    hostname: app-rabbitmq-server-platform
+    container_name: app-rabbitmq-server-platform
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "http://localhost:15672/img/rabbitmqlogo.svg" ]
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - ./tests/node_modules/@agct/test-utilities/.config/rabbitmq/definitions.json:/opt/rabbitmq/rabbit-definitions.json
+      - ./tests/node_modules/@agct/test-utilities/.config/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf
+
+  api-mock-server:
+    container_name: api-mock-server
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/docker-hub/mockserver/mockserver:5.15.0
+    ports:
+      - "1080:1080"
+    environment:
+      - MOCKSERVER_DISABLE_SYSTEM_OUT=true
+
+  api-fee:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: api-fee:local
+    container_name: api-fee
+    depends_on:
+      sidecar:
+        condition: service_started
+      app-rabbitmq-server-platform:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "http://localhost:3000/api/v1/fee/ping" ]
+    ports:
+      - "3000:3000"
+    env_file: .env
+
+  api-fee-mocked:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: api-fee:local
+    container_name: api-fee
+    depends_on:
+      sidecar:
+        condition: service_started
+      app-rabbitmq-server-platform:
+        condition: service_started
+      migrate-retailods:
+        condition: service_completed_successfully
+      migrate-StatementRetailDWH:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [ "CMD", "wget", "--spider", "http://localhost:3000/api/v1/fee/ping" ]
+    ports:
+      - "3000:3000"
+    env_file: .env.mocked
+
+  verification:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/node-testtools:18
+    user: node
+    depends_on:
+      api-fee:
+        condition: service_healthy
+    volumes:
+      - ./:/api
+    working_dir: /api/tests
+
+  acceptance:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/node-testtools:18
+    user: node
+    depends_on:
+      api-fee-mocked:
+        condition: service_healthy
+      api-mock-server:
+        condition: service_started
+      migrate-flex-CI:
+        condition: service_completed_successfully
+    volumes:
+      - ./:/api
+    working_dir: /api/tests
+    environment:
+      - API_MOCK_SERVER_HOST=api-mock-server
+      - API_MOCK_SERVER_PORT=1080
+
+  migrate-flex-CI:
+    container_name: migrateFlexCI
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/jvm-flyway-base:15
+    entrypoint: "flyway -X migrate"
+    working_dir: /migrate/
+    volumes:
+      - ./tests/.config/flyway:/migrate/
+      - ./migrations/:/migrate/migrations
+
+  db-mock-retailods:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/tool-mock-mssql/service:2.15.0
+    hostname: db-mock-retailods
+    container_name: db-mock-retailods
+    volumes:
+      - ./migrations/RetailODS-mock/FeeAPI/init-scripts/init.sql:/init-scripts/init.sql"
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/readiness.sh" ]
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      - DB_NAME=RetailODS
+
+  migrate-retailods:
+    container_name: migrate-retailods
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/jvm-flyway-base:15
+    working_dir: /migrate/
+    volumes:
+      - ./migrations/:/migrate/migrations
+    depends_on:
+      db-mock-retailods:
+        condition: service_healthy
+    env_file: .env.mocked
+    entrypoint: bash -c " flyway -url=$${AG_DB_RETAIL_ODS_URL} -user=$${FLYWAY_USERNAME} -password=$${FLYWAY_PASSWORD} -schemas=FeeAPI -locations=filesystem:./migrations/RetailODS/FeeAPI/Objects -X migrate"
+
+  db-mock-StatementRetailDWH:
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/tool-mock-mssql/service:2.15.0
+    hostname: db-mock-statement-retail-dwh
+    container_name: db-mock-statement-retail-dwh
+    volumes:
+      - ./migrations/StatementRetailDWH-mock/FeeAPI/init-scripts/init.sql:/init-scripts/init.sql"
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/readiness.sh" ]
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    environment:
+      - DB_NAME=StatementRetailDWH
+
+  migrate-StatementRetailDWH:
+    container_name: migrate-statement-retail-dwh
+    image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/jvm-flyway-base:15
+    working_dir: /migrate/
+    volumes:
+      - ./migrations/:/migrate/migrations
+    depends_on:
+      db-mock-StatementRetailDWH:
+        condition: service_healthy
+    env_file: .env.mocked
+    entrypoint: bash -c " flyway -url=$${AG_DB_STATEMENT_DWH_URL} -user=$${FLYWAY_USERNAME} -password=$${FLYWAY_PASSWORD} -schemas=FeeAPI -locations=filesystem:./migrations/StatementRetailDWH/FeeAPI/ -X migrate"

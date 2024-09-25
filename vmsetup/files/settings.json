@@ -1,0 +1,29 @@
+{
+  "http.proxyStrictSSL": false,
+  "workbench.colorTheme": "Monokai Dimmed",
+  "window.zoomLevel": 1,
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/bower_components": true,
+    "**/*.code-search": true,
+    "dist-app":true,
+    "dist-server": true,
+    "app/coverage":true,
+    "server/coverage": true
+  },
+  "editor.defaultFormatter": "dbaeumer.vscode-eslint",
+  "editor.tabSize": 2,
+  "eslint.format.enable": true,
+  "editor.formatOnSave": true,
+  "editor.detectIndentation": false,
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": false,
+    "source.fixAll": true
+  },
+  "javascript.updateImportsOnFileMove.enabled": "always",
+  "diffEditor.ignoreTrimWhitespace": false,
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features",
+    "editor.formatOnSave": true
+  }
+}

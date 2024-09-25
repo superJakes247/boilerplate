@@ -1,0 +1,210 @@
+# Run js tests in a CI environment. This job is only created
+# if tests/package.json and the relevant test folders exist (see individual
+# jobs below).
+#
+# This job only runs on Merge Requests
+
+include:
+  - templates/js-tests-v1.yml
+
+# Check that npm test packages are up to date with no vulnerabilities (and linted correctly)
+.jstest.hygiene.template:
+  stage: test
+  image: $JSTEST_IMAGE
+  variables:
+    working_path: ""
+  script:
+    - cd "$working_path"
+    - npm --quiet --no-progress --depth=0 --color=always ci
+    - npm run test:lint
+    - npm outdated --colors || true
+    - npm audit --registry=https://registry.npmjs.org --audit-level=moderate
+  allow_failure: true
+  needs: []
+
+jstest.hygiene:
+  extends: .jstest.hygiene.template
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - tests/package.json
+      when: always
+  variables:
+    working_path: "tests"
+
+jstest.hygiene.web.acceptance:
+  extends: .jstest.hygiene.template
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - tests/acceptance/package.json
+      when: always
+  variables:
+    working_path: "tests/acceptance"
+
+jstest.hygiene.web.verification:
+  stage: verify
+  extends: .jstest.hygiene.template
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - tests/**/playwright.config.*
+      when: always
+  variables:
+    working_path: "tests/verification"
+
+# Run acceptance tests from tests/__acceptance__
+jstest.acceptance:
+  extends: .js-tests
+  variables:
+    test_type: acc
+    test_command: test:acceptance
+    deploy_plan: acceptance-tests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - tests/__acceptance__/**/*
+      when: always
+  artifacts:
+    name: '$CI_JOB_STAGE-$CI_COMMIT_REF_NAME'
+    paths:
+      - 'tests/__acceptance__/**/__image_snapshots__/__diff_output__'
+    expire_in: 2 days
+
+# Run SQL acceptance tests from tests/__acceptance__
+jstest.sql.acceptance:
+  extends: jstest.acceptance
+  variables: 
+    test_type: sql-acc
+    test_command: test:sql:acceptance
+  rules:
+  - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"
+    exists:
+    - tests/__acceptance__/sql/**/*
+    when: always
+
+# Destroy js acceptance test environment.
+destroy-environment.js.acc:
+  stage: deploy
+  image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/ci/ci-tools
+  needs: []
+  allow_failure: true
+  extends: jstest.acceptance
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - tests/__acceptance__/**/*
+      when: manual
+  variables:
+    KUBERNETES_NAMESPACE_OVERWRITE: ci-${CI_PROJECT_ID}-${test_type}-${CI_COMMIT_REF_SLUG}
+  script:
+    - kubectl create configmap namespace-expired --dry-run=client -o yaml | kubectl apply -f -
+
+# Destroy js SQL acceptance test environment.
+destroy-environment.js.sql.acc:
+  extends: destroy-environment.js.acc
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - tests/__acceptance__/sql/*
+      when: manual
+  variables:
+    test_type: sql-acc
+
+# CI verification only happens on merge request pipelines.
+jstest.verification.ci:
+  extends: .js-tests
+  stage: test-ci
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - tests/__verification__/**/*
+  variables:
+    test_command: test:ci
+
+# DEV, INT and UAT verification, only after a deployment to
+# one of these named environments
+.jstest.verification:
+  extends: .js-tests
+  stage: verify
+  rules:
+    # Do not run a push pipeline if an MR exists for that branch or on a scheduled pipeline
+    - if: '($CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS) || $CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - exists:
+        - tests/__verification__/**/*
+      when: on_success
+    - when: never
+
+jstest.verification.dev:
+  extends: .jstest.verification
+  variables:
+    test_command: test:dev
+
+jstest.verification.int:
+  extends: .jstest.verification
+  variables:
+    test_command: test:int
+
+jstest.verification.uat:
+  extends: .jstest.verification
+  variables:
+    test_command: test:uat
+
+# Webapps are special, and they follow different conventions, so these
+# alternatives should serve them. The acceptance tests are often split up so
+# there isn't a central job. Jobs should be created as needed by extending
+# this job and setting `test_folder`
+.jstest.web.acceptance:
+  extends: .js-tests
+  variables:
+    # subfolder of /tests/acceptance containing the tests that will be run
+    test_folder:
+
+    test_type: acc
+    test_command: test:acceptance tests/acceptance/${test_folder}
+    working_path: tests/acceptance
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      exists:
+        - tests/acceptance/package.json
+  artifacts:
+    paths:
+      - 'tests/acceptance/tests/**/**/__image-snapshots__/**/**/__diff_output__'
+      - 'tests/acceptance/tests/__image-snapshots__/**/**/__diff_output__'
+    expire_in: 2 days
+    when: always
+
+.jstest.web.verification:
+  extends: .js-tests
+  stage: verify
+  image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/node-testtools:16
+  rules:
+    - if: '($CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS) || $CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - exists:
+        - tests/**/playwright.config.*
+      when: on_success
+    - when: never
+  before_script:
+    - export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+  variables:
+    working_path: tests/verification
+    test_type: "verification"
+    test_command: "test"
+  artifacts: { paths: [test-results], when: always, expire_in: 2 days }
+
+jstest.web.verification.dev:
+  extends: .jstest.web.verification
+  variables:
+    test_command: test:dev
+
+jstest.web.verification.int:
+  extends: .jstest.web.verification
+  variables:
+    test_command: test:int
+
+jstest.web.verification.uat:
+  extends: .jstest.web.verification
+  variables:
+    test_command: test:uat

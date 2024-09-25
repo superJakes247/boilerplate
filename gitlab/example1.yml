@@ -1,0 +1,133 @@
+include:
+  - { project: retail/delivery-engineering/tool-gitlab-jobs, file: modules/globals-v1.yml }
+
+variables:
+  PROJECT_NAME: lib-test-data
+  JSTEST_IMAGE: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/node-testtools:18
+
+image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/common/node-testtools:18
+
+.ci-tools: &ci-tools curl https://theluggage-agct.gray.net/artifactory/generic-development/ci/install.sh | CI_VERSION=13 bash
+.ag-deploy: &ag-deploy curl -fsS https://theluggage-agct.gray.net/artifactory/generic-development/ag-deploy/install.sh | bash
+
+stages:
+  - build
+  - test
+  - publish
+
+dbdeploy.build:
+  stage: build
+  image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/ci/ci-tools:latest
+  interruptible: true
+  variables:
+    dbdeploy_dockerfile: dbdeploy.Dockerfile
+    dbdeploy_image_name: 860638170744.dkr.ecr.af-south-1.amazonaws.com/${CI_PROJECT_NAME}/db-deploy
+  script:
+    - ci image.build --dockerfile "$dbdeploy_dockerfile" --image "$dbdeploy_image_name"
+
+jstest-hygiene:
+  stage: test
+  except: [ tags ]
+  script:
+    - npm ci
+    - npm audit --registry=https://registry.npmjs.org --colors --audit-level=moderate || true
+    - npm outdated --colors || true
+    - npm run lint
+
+acceptance:
+  stage: test
+  except: [ tags, schedules ]
+  variables:
+    KUBERNETES_NAMESPACE_OVERWRITE: ci-${CI_PROJECT_ID}-acc-${CI_COMMIT_REF_SLUG}
+  before_script:
+    - *ag-deploy
+  script:
+    - ag-deploy -n ${KUBERNETES_NAMESPACE_OVERWRITE} -p acceptance-tests
+    - npm ci
+    - npm run test:acceptance mock
+
+.tests-template: &tests-template
+  stage: test
+  except: [ tags ]
+  before_script:
+    - *ci-tools
+    - npm ci
+  variables:
+    NODE_OPTIONS: "–max-old-space-size=4096 --optimize_for_size"
+    KUBERNETES_CPU_REQUEST: '2'
+    KUBERNETES_MEMORY_REQUEST: 4Gi
+    KUBERNETES_MEMORY_LIMIT: 4Gi
+
+destroy.acceptance.env:
+  stage: test
+  image: 860638170744.dkr.ecr.af-south-1.amazonaws.com/ci/ci-tools
+  needs: []
+  allow_failure: true
+  rules:
+    - exists:
+        - tests/acceptance/**/*
+      when: manual
+  variables:
+    KUBERNETES_NAMESPACE_OVERWRITE: ci-${CI_PROJECT_ID}-acc-${CI_COMMIT_REF_SLUG}
+  script:
+    - kubectl create configmap namespace-expired --dry-run=client -o yaml | kubectl apply -f -
+
+dev-tests:
+  <<: *tests-template
+  except: [ tags ]
+  script:
+    - npm run test:dev
+  allow_failure: true
+
+int-tests:
+  <<: *tests-template
+  except: [ tags ]
+  script:
+    - npm run test:int
+  allow_failure: true
+
+uat-tests:
+  <<: *tests-template
+  except: [ tags ]
+  script:
+    - npm run test:uat
+  allow_failure: true
+
+publish:
+  stage: publish
+  only: [ master ]
+  except: [ tags ]
+  variables:
+    GIT_DEPTH: 50
+  before_script:
+    - *ci-tools
+  script:
+    - npm version from-git --no-git-tag-version
+    - >
+      case "$CI_COMMIT_MESSAGE" in
+        *break:*)
+          echo "Commit message contains - Break - major version bump"
+          export VERSION=$(npm version major --no-git-tag-version)
+          ;; 
+        *feature:*)
+          echo "Commit message contains - Feature - minor version bump"
+          export VERSION=$(npm version minor --no-git-tag-version)
+          ;;
+        *)
+          echo "Fix - patch version bump"
+          export VERSION=$(npm version patch --no-git-tag-version)
+          ;;
+      esac 
+    - ci login.npm
+    - npm --no-progress --quiet publish
+    - >
+      if ! curl -fsS --request POST \
+          -H "PRIVATE-TOKEN:$GITLAB_API_TOKEN" \
+          --form "ref=$CI_COMMIT_SHA" \
+          --form "tag_name=$VERSION" \
+          --form "message=Published by $GITLAB_USER_NAME at $(date)" \
+          https://gitlab.gray.net/api/v4/projects/${CI_PROJECT_ID}/repository/tags; then
+        printf "\e[31mCreating tags failed.\nAre 'v*' tags protected in the repository?\n\e[0m"
+        exit 1
+      fi
+
